@@ -10,6 +10,7 @@
  * GNU GPL, version 2 or (at your option) any later version.
  */
 
+#include <sys/mman.h>
 #include "block/block_int.h"
 #include "qemu/option.h"
 
@@ -43,30 +44,24 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
     BDRVCrdState *s = bs->opaque;
     int ret = 0;
     uint8_t *buf;
-    int64_t offset;
-    size_t size;
-    struct iovec *i;
+    size_t offset, copied;
+    int i;
+    struct iovec *iov;
+    //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
     
     offset = sector_num * BDRV_SECTOR_SIZE;
-    size = nb_sectors * BDRV_SECTOR_SIZE;
-        fprintf(stderr, "hanjae test %s -1 sector_num %ld nb_sectors %d offset %ld size %lu\n", __func__, sector_num, nb_sectors, offset, size);
 
     qemu_co_mutex_lock(&s->lock);
 
-    /* from block/ssh.c
-     */
-    /* This keeps track of the current iovec element ('i'), where we
-     * will write to next ('buf'), and the end of the current iovec
-     * ('end_of_vec').
-     */
-    i = &qiov->iov[0];
-    buf = i->iov_base;
-
-    memcpy(buf, s->ptr_crd + offset, size);
-        fprintf(stderr, "hanjae test %s -2\n", __func__);
+    copied = 0;
+    for (i = 0; i < qiov->niov; i++) {
+        iov = &qiov->iov[i];
+        buf = iov->iov_base;
+        memcpy(buf, s->ptr_crd + offset + copied, iov->iov_len);
+        copied += iov->iov_len;
+    }
 
     qemu_co_mutex_unlock(&s->lock);
-        fprintf(stderr, "hanjae test %s -3\n", __func__);
 
     return ret;
 }
@@ -76,22 +71,23 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
 {
     BDRVCrdState *s = bs->opaque;
     int ret = 0;
-    int64_t offset;
-    size_t size;
-
-    char *buf;
-    struct iovec *i;
-        fprintf(stderr, "hanjae test %s\n", __func__);
+    uint8_t *buf;
+    size_t offset, copied;
+    int i;
+    struct iovec *iov;
+    //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
 
     offset = sector_num * BDRV_SECTOR_SIZE;
-    size = nb_sectors * BDRV_SECTOR_SIZE;
 
     qemu_co_mutex_lock(&s->lock);
 
-    i = &qiov->iov[0];
-    buf = i->iov_base;
-
-    memcpy(s->ptr_crd + offset, buf, size);
+    copied = 0;
+    for (i = 0; i < qiov->niov; i++) {
+        iov = &qiov->iov[i];
+        buf = iov->iov_base;
+        memcpy(s->ptr_crd + offset + copied, buf, iov->iov_len);
+        copied += iov->iov_len;
+    }
 
     qemu_co_mutex_unlock(&s->lock);
 
@@ -100,20 +96,17 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
 
 static int64_t crd_getlength(BlockDriverState *bs)
 {
-        fprintf(stderr, "hanjae test %s\n", __func__);
     return 512 * 1024 * 1024;
 }
 
 static int crd_has_zero_init(BlockDriverState *bs)
 {
-        fprintf(stderr, "hanjae test %s\n", __func__);
     return 0;
 }
 
 static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
                          Error **errp)
 {
-        fprintf(stderr, "hanjae test %s\n", __func__);
     BDRVCrdState *s = bs->opaque;
     QemuOpts *opts;
     opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
@@ -121,9 +114,13 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     qemu_opts_del(opts);
 
     s->ptr_crd = malloc(512 * 1024 * 1024);
-    if (s->ptr_crd == NULL)
+    if (s->ptr_crd == NULL) {
         fprintf(stderr, "malloc failed\n");
-    memset(s->ptr_crd, 0, 512 * 1024 * 1024);
+        memset(s->ptr_crd, 0, 512 * 1024 * 1024);
+        if (mlock(s->ptr_crd, 512 * 1024 * 1024)) {
+            fprintf(stderr, "hanjae mlock failed %s\n", __func__);
+        }
+    }
     qemu_co_mutex_init(&s->lock);
     return 0;
 }
@@ -132,6 +129,7 @@ static void crd_close(BlockDriverState *bs)
 {
     BDRVCrdState *s = bs->opaque;
         fprintf(stderr, "hanjae test %s\n", __func__);
+    munlock(s->ptr_crd, 512 * 1024 * 1024);
     free(s->ptr_crd);
 }
 

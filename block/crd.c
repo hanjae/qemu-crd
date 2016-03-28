@@ -113,13 +113,15 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     qemu_opts_absorb_qdict(opts, options, &error_abort);
     qemu_opts_del(opts);
 
-    s->ptr_crd = malloc(512 * 1024 * 1024);
-    if (s->ptr_crd == NULL) {
+    //s->ptr_crd = malloc(512 * 1024 * 1024);
+    s->ptr_crd = mmap(0, 512 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+    if (s->ptr_crd == (void *)-1) {
         fprintf(stderr, "malloc failed\n");
-        memset(s->ptr_crd, 0, 512 * 1024 * 1024);
-        if (mlock(s->ptr_crd, 512 * 1024 * 1024)) {
-            fprintf(stderr, "hanjae mlock failed %s\n", __func__);
-        }
+        return -1;
+    }
+    memset(s->ptr_crd, 0, 512 * 1024 * 1024);
+    if (mlock(s->ptr_crd, 512 * 1024 * 1024)) {
+        fprintf(stderr, "hanjae mlock failed %s\n", __func__);
     }
     qemu_co_mutex_init(&s->lock);
     return 0;
@@ -130,7 +132,8 @@ static void crd_close(BlockDriverState *bs)
     BDRVCrdState *s = bs->opaque;
         fprintf(stderr, "hanjae test %s\n", __func__);
     munlock(s->ptr_crd, 512 * 1024 * 1024);
-    free(s->ptr_crd);
+    //free(s->ptr_crd);
+    munmap(s->ptr_crd, 512 * 1024 * 1024);
 }
 
 static coroutine_fn int crd_co_flush(BlockDriverState *bs)

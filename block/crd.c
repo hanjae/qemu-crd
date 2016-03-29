@@ -14,6 +14,8 @@
 #include "block/block_int.h"
 #include "qemu/option.h"
 
+#define CRD_SIZE 512
+
 static QemuOptsList runtime_opts = {
     .name = "null",
     .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
@@ -96,7 +98,7 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
 
 static int64_t crd_getlength(BlockDriverState *bs)
 {
-    return 512 * 1024 * 1024;
+    return CRD_SIZE * 1024 * 1024;
 }
 
 static int crd_has_zero_init(BlockDriverState *bs)
@@ -113,14 +115,14 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     qemu_opts_absorb_qdict(opts, options, &error_abort);
     qemu_opts_del(opts);
 
-    //s->ptr_crd = malloc(512 * 1024 * 1024);
-    s->ptr_crd = mmap(0, 512 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+    //s->ptr_crd = malloc(CRD_SIZE * 1024 * 1024);
+    s->ptr_crd = mmap(0, CRD_SIZE * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (s->ptr_crd == (void *)-1) {
         fprintf(stderr, "malloc failed\n");
         return -1;
     }
-    memset(s->ptr_crd, 0, 512 * 1024 * 1024);
-    if (mlock(s->ptr_crd, 512 * 1024 * 1024)) {
+    memset(s->ptr_crd, 0, CRD_SIZE * 1024 * 1024);
+    if (mlock(s->ptr_crd, CRD_SIZE * 1024 * 1024)) {
         fprintf(stderr, "hanjae mlock failed %s\n", __func__);
     }
     qemu_co_mutex_init(&s->lock);
@@ -131,9 +133,9 @@ static void crd_close(BlockDriverState *bs)
 {
     BDRVCrdState *s = bs->opaque;
         fprintf(stderr, "hanjae test %s\n", __func__);
-    munlock(s->ptr_crd, 512 * 1024 * 1024);
+    munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
     //free(s->ptr_crd);
-    munmap(s->ptr_crd, 512 * 1024 * 1024);
+    munmap(s->ptr_crd, CRD_SIZE * 1024 * 1024);
 }
 
 static coroutine_fn int crd_co_flush(BlockDriverState *bs)

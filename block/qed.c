@@ -19,6 +19,7 @@
 #include <lzo/lzo1x.h>
 
 #define CRD_SIZE 512
+#define PAGE_SIZE 4096
 
 static QemuOptsList runtime_opts = {
     .name = "null",
@@ -52,17 +53,18 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
     BDRVCrdState *s = bs->opaque;
     int ret = 0;
     uint8_t *buf;
-    size_t offset, copied;
+    //size_t offset;
+    size_t copied;
     int i;
     struct iovec *iov;
+
     int page_num;
-    int page_offset;
+    //int page_offset;
     size_t iov_len;
     //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
     
-    offset = sector_num * BDRV_SECTOR_SIZE;
+    //offset = sector_num * BDRV_SECTOR_SIZE;
     page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
-    page_offset = sector_num % 8 * 512;
 
     qemu_co_mutex_lock(&s->lock);
 
@@ -72,13 +74,31 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
         iov_len = iov->iov_len;
         buf = iov->iov_base;
         while (iov_len > 0) {
-
-        memcpy(buf, s->ptr_crd + offset + copied, iov->iov_len);
+            if (unlikely(iov_len < PAGE_SIZE)) {
+                if (s->page_mapped[page_num] == 0) {
+                    memset(buf, 0, iov_len);
+                } else {
+                    memcpy(buf, s->ptr_crd[page_num], iov_len);
+                }
+                iov_len = 0;
+            } else {
+                if (s->page_mapped[page_num] == 0) {
+                    memset(buf, 0, PAGE_SIZE);
+                } else {
+                    memcpy(buf, s->ptr_crd[page_num], PAGE_SIZE);
+                }
+                iov_len -= PAGE_SIZE;
+                buf += PAGE_SIZE;
+            }
+            page_num++;
+        }
         copied += iov->iov_len;
     }
+    /*
     for (i = 0; i < qiov->niov; i++) {
         printf("read iovnum %d, len %lu\n", i, iov->iov_len);
     }
+    */
 
     qemu_co_mutex_unlock(&s->lock);
 
@@ -91,25 +111,55 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
     BDRVCrdState *s = bs->opaque;
     int ret = 0;
     uint8_t *buf;
-    size_t offset, copied;
+    //size_t offset;
+    size_t copied;
     int i;
     struct iovec *iov;
+
+    int page_num;
+    //int page_offset;
+    size_t iov_len;
     //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
 
-    offset = sector_num * BDRV_SECTOR_SIZE;
+    //offset = sector_num * BDRV_SECTOR_SIZE;
+    page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
 
     qemu_co_mutex_lock(&s->lock);
 
     copied = 0;
     for (i = 0; i < qiov->niov; i++) {
         iov = &qiov->iov[i];
+        iov_len = iov->iov_len;
         buf = iov->iov_base;
-        memcpy(s->ptr_crd + offset + copied, buf, iov->iov_len);
+        while (iov_len > 0) {
+            if (unlikely(iov_len < PAGE_SIZE)) {
+                /* TODO modity */
+                if (s->page_mapped[page_num] == 1) {
+                    free(s->ptr_crd[page_num]);
+                }
+                s->ptr_crd[page_num] = malloc(PAGE_SIZE);
+                s->page_mapped[page_num] = 1;
+                memcpy(s->ptr_crd[page_num], buf, iov_len);
+                iov_len = 0;
+            } else {
+                if (s->page_mapped[page_num] == 1) {
+                    free(s->ptr_crd[page_num]);
+                }
+                s->ptr_crd[page_num] = malloc(PAGE_SIZE);
+                s->page_mapped[page_num] = 1;
+                memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
+                iov_len -= PAGE_SIZE;
+                buf += PAGE_SIZE;
+            }
+            page_num++;
+        }
         copied += iov->iov_len;
     }
+    /*
     for (i = 0; i < qiov->niov; i++) {
         printf("write iovnum %d, len %lu\n", i, iov->iov_len);
     }
+    */
 
     qemu_co_mutex_unlock(&s->lock);
 
@@ -154,7 +204,7 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
 
 static void crd_close(BlockDriverState *bs)
 {
-    BDRVCrdState *s = bs->opaque;
+    //BDRVCrdState *s = bs->opaque;
         fprintf(stderr, "hanjae test %s\n", __func__);
     //munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
     //free(s->ptr_crd);

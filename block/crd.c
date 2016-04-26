@@ -13,6 +13,10 @@
 #include <sys/mman.h>
 #include "block/block_int.h"
 #include "qemu/option.h"
+#include "block/aio.h"
+#include "block/thread-pool.h"
+
+#include <lzo/lzo1x.h>
 
 #define CRD_SIZE 512
 
@@ -144,6 +148,137 @@ static coroutine_fn int crd_co_flush(BlockDriverState *bs)
     return 0;
 }
 
+typedef struct {
+    BlockAIOCB common;
+    QEMUBH *bh;
+    QEMUIOVector *qiov;
+
+    int64_t sector_num;
+    int nb_sectors;
+
+    size_t start;
+    size_t end;
+    /* 0 : write
+     * 1 : read
+     * 2 : flush
+     */
+    int type;
+} CrdAIOCB;
+
+static const AIOCBInfo crd_aiocb_info = {
+    .aiocb_size = sizeof(CrdAIOCB),
+};
+
+
+static void crd_readv_bh_cb(void *p)
+{
+    CrdAIOCB *acb = p;
+    BDRVCrdState *s = acb->common.bs->opaque;
+    uint8_t *buf;
+    size_t offset, copied;
+    int i;
+    struct iovec *iov;
+
+    qemu_bh_delete(acb->bh);
+    acb->bh = NULL;
+
+    offset = acb->sector_num * BDRV_SECTOR_SIZE;
+
+    copied = 0;
+    for (i = 0; i < acb->qiov->niov; i++) {
+        iov = &acb->qiov->iov[i];
+        buf = iov->iov_base;
+        memcpy(buf, s->ptr_crd + offset + copied, iov->iov_len);
+        copied += iov->iov_len;
+    }
+    acb->common.cb(acb->common.opaque, 0);
+    qemu_aio_unref(acb);
+}
+
+static BlockAIOCB *crd_aio_readv(BlockDriverState *bs,
+                                  int64_t sector_num, QEMUIOVector *qiov,
+                                  int nb_sectors,
+                                  BlockCompletionFunc *cb,
+                                  void *opaque)
+{
+    CrdAIOCB *acb;
+
+    acb = qemu_aio_get(&crd_aiocb_info, bs, cb, opaque);
+
+    acb->qiov = qiov;
+    acb->sector_num = sector_num;
+    acb->nb_sectors = nb_sectors;
+
+    acb->bh = aio_bh_new(bdrv_get_aio_context(bs), crd_readv_bh_cb, acb);
+    qemu_bh_schedule(acb->bh);
+    return &acb->common;
+}
+
+static void crd_writev_bh_cb(void *p)
+{
+    CrdAIOCB *acb = p;
+    BDRVCrdState *s = acb->common.bs->opaque;
+    uint8_t *buf;
+    size_t offset, copied;
+    int i;
+    struct iovec *iov;
+
+    qemu_bh_delete(acb->bh);
+    acb->bh = NULL;
+
+    offset = acb->sector_num * BDRV_SECTOR_SIZE;
+
+    copied = 0;
+    for (i = 0; i < acb->qiov->niov; i++) {
+        iov = &acb->qiov->iov[i];
+        buf = iov->iov_base;
+        memcpy(s->ptr_crd + offset + copied, buf, iov->iov_len);
+        copied += iov->iov_len;
+    }
+    acb->common.cb(acb->common.opaque, 0);
+    qemu_aio_unref(acb);
+}
+
+static BlockAIOCB *crd_aio_writev(BlockDriverState *bs,
+                                   int64_t sector_num, QEMUIOVector *qiov,
+                                   int nb_sectors,
+                                   BlockCompletionFunc *cb,
+                                   void *opaque)
+{
+    CrdAIOCB *acb;
+
+    acb = qemu_aio_get(&crd_aiocb_info, bs, cb, opaque);
+
+    acb->qiov = qiov;
+    acb->sector_num = sector_num;
+    acb->nb_sectors = nb_sectors;
+
+    acb->bh = aio_bh_new(bdrv_get_aio_context(bs), crd_writev_bh_cb, acb);
+    qemu_bh_schedule(acb->bh);
+    return &acb->common;
+}
+
+static void crd_flushv_bh_cb(void *p)
+{
+    CrdAIOCB *acb = p;
+    qemu_bh_delete(acb->bh);
+    acb->common.cb(acb->common.opaque, 0);
+    qemu_aio_unref(acb);
+        fprintf(stderr, "hanjae test %s\n", __func__);
+}
+static BlockAIOCB *crd_aio_flush(BlockDriverState *bs,
+                                  BlockCompletionFunc *cb,
+                                  void *opaque)
+{
+    CrdAIOCB *acb;
+
+    acb = qemu_aio_get(&crd_aiocb_info, bs, cb, opaque);
+
+    acb->bh = aio_bh_new(bdrv_get_aio_context(bs), crd_flushv_bh_cb, acb);
+    qemu_bh_schedule(acb->bh);
+    return &acb->common;
+}
+
 static int crd_reopen_prepare(BDRVReopenState *reopen_state,
                                BlockReopenQueue *queue, Error **errp)
 {
@@ -164,6 +299,24 @@ BlockDriver bdrv_crd = {
     .bdrv_co_readv         = crd_co_readv,
     .bdrv_co_writev        = crd_co_writev,
     .bdrv_co_flush_to_disk = crd_co_flush,
+
+    .bdrv_has_zero_init    = crd_has_zero_init,
+    .bdrv_reopen_prepare   = crd_reopen_prepare,
+};
+
+BlockDriver bdrv_crd_aio = {
+    .format_name           = "crd-aio",
+    .protocol_name         = "crd-aio",
+    .instance_size         = sizeof(BDRVCrdState),
+    
+    .bdrv_file_open        = crd_file_open,
+    .bdrv_close            = crd_close,
+    .bdrv_getlength        = crd_getlength,
+
+    .bdrv_aio_readv        = crd_aio_readv,
+    .bdrv_aio_writev       = crd_aio_writev,
+    .bdrv_aio_flush        = crd_aio_flush,
+
     .bdrv_has_zero_init    = crd_has_zero_init,
     .bdrv_reopen_prepare   = crd_reopen_prepare,
 };
@@ -171,6 +324,7 @@ BlockDriver bdrv_crd = {
 static void bdrv_crd_init(void)
 {
     bdrv_register(&bdrv_crd);
+    bdrv_register(&bdrv_crd_aio);
 }
 
 block_init(bdrv_crd_init);

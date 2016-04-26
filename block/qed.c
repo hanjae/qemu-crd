@@ -41,7 +41,8 @@ static QemuOptsList runtime_opts = {
 typedef struct BDRVCrdState {
     /* Coroutine. */
     CoMutex lock;
-    void *ptr_crd;
+    void *ptr_crd[131072];
+    uint8_t page_mapped[131072];
 } BDRVCrdState;
 
 
@@ -54,18 +55,29 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
     size_t offset, copied;
     int i;
     struct iovec *iov;
+    int page_num;
+    int page_offset;
+    size_t iov_len;
     //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
     
     offset = sector_num * BDRV_SECTOR_SIZE;
+    page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
+    page_offset = sector_num % 8 * 512;
 
     qemu_co_mutex_lock(&s->lock);
 
     copied = 0;
     for (i = 0; i < qiov->niov; i++) {
         iov = &qiov->iov[i];
+        iov_len = iov->iov_len;
         buf = iov->iov_base;
+        while (iov_len > 0) {
+
         memcpy(buf, s->ptr_crd + offset + copied, iov->iov_len);
         copied += iov->iov_len;
+    }
+    for (i = 0; i < qiov->niov; i++) {
+        printf("read iovnum %d, len %lu\n", i, iov->iov_len);
     }
 
     qemu_co_mutex_unlock(&s->lock);
@@ -95,6 +107,9 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
         memcpy(s->ptr_crd + offset + copied, buf, iov->iov_len);
         copied += iov->iov_len;
     }
+    for (i = 0; i < qiov->niov; i++) {
+        printf("write iovnum %d, len %lu\n", i, iov->iov_len);
+    }
 
     qemu_co_mutex_unlock(&s->lock);
 
@@ -120,7 +135,9 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     qemu_opts_absorb_qdict(opts, options, &error_abort);
     qemu_opts_del(opts);
 
+    memset(s->page_mapped, 0, 128 * 1024);
     //s->ptr_crd = malloc(CRD_SIZE * 1024 * 1024);
+    /*
     s->ptr_crd = mmap(0, CRD_SIZE * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (s->ptr_crd == (void *)-1) {
         fprintf(stderr, "malloc failed\n");
@@ -130,6 +147,7 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     if (mlock(s->ptr_crd, CRD_SIZE * 1024 * 1024)) {
         fprintf(stderr, "hanjae mlock failed %s\n", __func__);
     }
+    */
     qemu_co_mutex_init(&s->lock);
     return 0;
 }
@@ -138,9 +156,9 @@ static void crd_close(BlockDriverState *bs)
 {
     BDRVCrdState *s = bs->opaque;
         fprintf(stderr, "hanjae test %s\n", __func__);
-    munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
+    //munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
     //free(s->ptr_crd);
-    munmap(s->ptr_crd, CRD_SIZE * 1024 * 1024);
+    //munmap(s->ptr_crd, CRD_SIZE * 1024 * 1024);
 }
 
 static coroutine_fn int crd_co_flush(BlockDriverState *bs)

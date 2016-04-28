@@ -88,7 +88,7 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
     //offset = sector_num * BDRV_SECTOR_SIZE;
     page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
 
-    qemu_co_mutex_lock(&s->lock);
+    //qemu_co_mutex_lock(&s->lock);
 
     copied = 0;
     for (i = 0; i < qiov->niov; i++) {
@@ -111,19 +111,19 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
             } else {
                 if (s->page_mapped[page_num] == PAGE_ZERO_FILLED) {
                     memset(buf, 0, PAGE_SIZE);
-                    printf("Decompression - zero filled %d\n", page_num);
+                    //printf("Decompression - zero filled %d\n", page_num);
                 } else if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
                     memcpy(buf, s->ptr_crd[page_num], PAGE_SIZE);
-                    printf("Decompression - not compressed %d\n", page_num);
+                    //printf("Decompression - not compressed %d\n", page_num);
                 } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
                     size_out = PAGE_SIZE;
                     if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
-                        int err =
-                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
                        printf("Decompression failed! %d %d\n", page_num, s->page_compressed_size[page_num]);
+                    /*    int err =
+                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
                        printf("ERRNO %d -  %s\n", err, strerror(errno));
                     } else {
-                        printf("Decompression success %d\n", page_num);
+                        //printf("Decompression success %d\n", page_num); */
                     }
                     memcpy(buf, s->buf_out, PAGE_SIZE);
                 }
@@ -140,7 +140,7 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
     }
     */
 
-    qemu_co_mutex_unlock(&s->lock);
+    //qemu_co_mutex_unlock(&s->lock);
 
     return ret;
 }
@@ -166,7 +166,7 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
     //offset = sector_num * BDRV_SECTOR_SIZE;
     page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
 
-    qemu_co_mutex_lock(&s->lock);
+    //qemu_co_mutex_lock(&s->lock);
 
     copied = 0;
     for (i = 0; i < qiov->niov; i++) {
@@ -186,28 +186,34 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
             } else {
             */
                 // 1 or 2
-                if (s->page_mapped[page_num]) {
+                if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
+                    munlock(s->ptr_crd[page_num], PAGE_SIZE);
+                    free(s->ptr_crd[page_num]);
+                } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
+                    munlock(s->ptr_crd[page_num], s->page_compressed_size[page_num]);
                     free(s->ptr_crd[page_num]);
                 }
                 if (page_zero_filled(buf)) {
                     s->page_mapped[page_num] = PAGE_ZERO_FILLED;
-                    printf("Not Compressed page_num %d - zero filled\n", page_num);
+                    //printf("Not Compressed page_num %d - zero filled\n", page_num);
                 } else {
                     /////compress here
                     if (lzo1x_1_compress(buf, PAGE_SIZE, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
-                       printf("Compression failed!\n");
+                       //printf("Compression failed!\n");
                     }
                     if (size_out > PAGE_SIZE) {
                         //use uncompressed
                         s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
                         s->ptr_crd[page_num] = malloc(PAGE_SIZE);
-                        printf("Not Compressed page_num %d\n", page_num);
+                        mlock(s->ptr_crd[page_num], PAGE_SIZE);
+                        //printf("Not Compressed page_num %d\n", page_num);
                         memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
                     } else {
                         s->page_mapped[page_num] = PAGE_COMPRESSED;
                         s->ptr_crd[page_num] = malloc(size_out);
+                        mlock(s->ptr_crd[page_num], size_out);
                         s->page_compressed_size[page_num] = size_out;
-                        printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
+                        //printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
                         memcpy(s->ptr_crd[page_num], s->buf_out, size_out);
                     }
                 }
@@ -224,7 +230,7 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
     }
     */
 
-    qemu_co_mutex_unlock(&s->lock);
+    //qemu_co_mutex_unlock(&s->lock);
 
     return ret;
 }
@@ -250,10 +256,17 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
 
     memset(s->page_mapped, 0, 128 * 1024);
     s->wrkmem = g_malloc(LZO1X_1_MEM_COMPRESS);
+    if (mlock(s->wrkmem, LZO1X_1_MEM_COMPRESS)) {
+        fprintf(stderr, "hanjae mlock failed 1 %s %s %d\n", __func__, strerror(errno), LZO1X_1_MEM_COMPRESS);
+    }
+
     if (lzo_init() != LZO_E_OK) {
         error_setg(errp, "failed to initialize the LZO library");
     }
     s->buf_out = g_malloc(4200);
+    if (mlock(s->buf_out, 4200)) {
+        fprintf(stderr, "hanjae mlock failed 2 %s %s\n", __func__, strerror(errno));
+    }
 
     //s->ptr_crd = malloc(CRD_SIZE * 1024 * 1024);
     /*
@@ -267,12 +280,6 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
         fprintf(stderr, "hanjae mlock failed %s\n", __func__);
     }
     */
-    if (mlock(s->page_mapped, 131072)) {
-        fprintf(stderr, "hanjae mlock failed %s\n", __func__);
-    }
-    if (mlock(s->page_compressed_size, 131072)) {
-        fprintf(stderr, "hanjae mlock failed %s\n", __func__);
-    }
     qemu_co_mutex_init(&s->lock);
     return 0;
 }
@@ -280,11 +287,28 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
 static void crd_close(BlockDriverState *bs)
 {
     BDRVCrdState *s = bs->opaque;
-        fprintf(stderr, "hanjae test %s\n", __func__);
+    int i;
+
+    int nz = 0;
+    int nf = 0;
+    int nc = 0;
+    unsigned long sum = 0;
+
+    for (i = 0; i < 131072; i++) {
+        if (s->page_mapped[i] == PAGE_ZERO_FILLED) {
+            nz++;
+        } else if (s->page_mapped[i] == PAGE_UNCOMPRESSED) {
+            nf++;
+        } else {
+            nc++;
+            sum += s->page_compressed_size[i];
+        }
+    }
+    printf("nz %d nf %d nc %d average compression %d\n", nz, nf, nc, (int)(sum / nc));
+
+    fprintf(stderr, "hanjae test %s\n", __func__);
     g_free(s->wrkmem);
     g_free(s->buf_out);
-    munlock(s->page_mapped, 131072);
-    munlock(s->page_compressed_size, 131072 * 4);
     //munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
     //free(s->ptr_crd);
     //munmap(s->ptr_crd, CRD_SIZE * 1024 * 1024);

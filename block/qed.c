@@ -18,8 +18,11 @@
 
 #include <lzo/lzo1x.h>
 
-#define CRD_SIZE 512
-#define PAGE_SIZE 4096
+#define CRD_SIZE            512
+#define PAGE_SIZE           4096
+#define PAGE_ZERO_FILLED    0
+#define PAGE_COMPRESSED     1
+#define PAGE_UNCOMPRESSED   2
 
 static QemuOptsList runtime_opts = {
     .name = "null",
@@ -44,8 +47,25 @@ typedef struct BDRVCrdState {
     CoMutex lock;
     void *ptr_crd[131072];
     uint8_t page_mapped[131072];
+    int page_compressed_size[131072];
+    lzo_bytep wrkmem;
+    uint8_t *buf_out;
 } BDRVCrdState;
 
+static int page_zero_filled(void *ptr)
+{
+        unsigned int pos;
+        unsigned long *page;
+
+        page = (unsigned long *)ptr;
+
+        for (pos = 0; pos != PAGE_SIZE / sizeof(*page); pos++) {
+                if (page[pos])
+                        return 0;
+        }
+
+        return 1;
+}
 
 static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
                                      int nb_sectors, QEMUIOVector *qiov)
@@ -62,6 +82,8 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
     //int page_offset;
     size_t iov_len;
     //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
+
+    lzo_uint size_out;
     
     //offset = sector_num * BDRV_SECTOR_SIZE;
     page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
@@ -75,17 +97,35 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
         buf = iov->iov_base;
         while (iov_len > 0) {
             if (unlikely(iov_len < PAGE_SIZE)) {
+                /* fix this I ignore this since there's no request matches to PAGE_SIZE */
+
+                memset(buf, 0, iov_len);
+                /*
                 if (s->page_mapped[page_num] == 0) {
                     memset(buf, 0, iov_len);
                 } else {
                     memcpy(buf, s->ptr_crd[page_num], iov_len);
                 }
+                */
                 iov_len = 0;
             } else {
-                if (s->page_mapped[page_num] == 0) {
+                if (s->page_mapped[page_num] == PAGE_ZERO_FILLED) {
                     memset(buf, 0, PAGE_SIZE);
-                } else {
+                    printf("Decompression - zero filled %d\n", page_num);
+                } else if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
                     memcpy(buf, s->ptr_crd[page_num], PAGE_SIZE);
+                    printf("Decompression - not compressed %d\n", page_num);
+                } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
+                    size_out = PAGE_SIZE;
+                    if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                        int err =
+                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
+                       printf("Decompression failed! %d %d\n", page_num, s->page_compressed_size[page_num]);
+                       printf("ERRNO %d -  %s\n", err, strerror(errno));
+                    } else {
+                        printf("Decompression success %d\n", page_num);
+                    }
+                    memcpy(buf, s->buf_out, PAGE_SIZE);
                 }
                 iov_len -= PAGE_SIZE;
                 buf += PAGE_SIZE;
@@ -121,6 +161,8 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
     size_t iov_len;
     //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
 
+    lzo_uint size_out;
+
     //offset = sector_num * BDRV_SECTOR_SIZE;
     page_num = sector_num >> 3; // sector_size = 512 & page_size 4096
 
@@ -132,8 +174,8 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
         iov_len = iov->iov_len;
         buf = iov->iov_base;
         while (iov_len > 0) {
+            /* TODO implement
             if (unlikely(iov_len < PAGE_SIZE)) {
-                /* TODO modity */
                 if (s->page_mapped[page_num] == 1) {
                     free(s->ptr_crd[page_num]);
                 }
@@ -142,15 +184,36 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
                 memcpy(s->ptr_crd[page_num], buf, iov_len);
                 iov_len = 0;
             } else {
-                if (s->page_mapped[page_num] == 1) {
+            */
+                // 1 or 2
+                if (s->page_mapped[page_num]) {
                     free(s->ptr_crd[page_num]);
                 }
-                s->ptr_crd[page_num] = malloc(PAGE_SIZE);
-                s->page_mapped[page_num] = 1;
-                memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
+                if (page_zero_filled(buf)) {
+                    s->page_mapped[page_num] = PAGE_ZERO_FILLED;
+                    printf("Not Compressed page_num %d - zero filled\n", page_num);
+                } else {
+                    /////compress here
+                    if (lzo1x_1_compress(buf, PAGE_SIZE, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                       printf("Compression failed!\n");
+                    }
+                    if (size_out > PAGE_SIZE) {
+                        //use uncompressed
+                        s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
+                        s->ptr_crd[page_num] = malloc(PAGE_SIZE);
+                        printf("Not Compressed page_num %d\n", page_num);
+                        memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
+                    } else {
+                        s->page_mapped[page_num] = PAGE_COMPRESSED;
+                        s->ptr_crd[page_num] = malloc(size_out);
+                        s->page_compressed_size[page_num] = size_out;
+                        printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
+                        memcpy(s->ptr_crd[page_num], s->buf_out, size_out);
+                    }
+                }
                 iov_len -= PAGE_SIZE;
                 buf += PAGE_SIZE;
-            }
+            /*}*/
             page_num++;
         }
         copied += iov->iov_len;
@@ -186,6 +249,12 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     qemu_opts_del(opts);
 
     memset(s->page_mapped, 0, 128 * 1024);
+    s->wrkmem = g_malloc(LZO1X_1_MEM_COMPRESS);
+    if (lzo_init() != LZO_E_OK) {
+        error_setg(errp, "failed to initialize the LZO library");
+    }
+    s->buf_out = g_malloc(4200);
+
     //s->ptr_crd = malloc(CRD_SIZE * 1024 * 1024);
     /*
     s->ptr_crd = mmap(0, CRD_SIZE * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
@@ -198,14 +267,24 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
         fprintf(stderr, "hanjae mlock failed %s\n", __func__);
     }
     */
+    if (mlock(s->page_mapped, 131072)) {
+        fprintf(stderr, "hanjae mlock failed %s\n", __func__);
+    }
+    if (mlock(s->page_compressed_size, 131072)) {
+        fprintf(stderr, "hanjae mlock failed %s\n", __func__);
+    }
     qemu_co_mutex_init(&s->lock);
     return 0;
 }
 
 static void crd_close(BlockDriverState *bs)
 {
-    //BDRVCrdState *s = bs->opaque;
+    BDRVCrdState *s = bs->opaque;
         fprintf(stderr, "hanjae test %s\n", __func__);
+    g_free(s->wrkmem);
+    g_free(s->buf_out);
+    munlock(s->page_mapped, 131072);
+    munlock(s->page_compressed_size, 131072 * 4);
     //munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
     //free(s->ptr_crd);
     //munmap(s->ptr_crd, CRD_SIZE * 1024 * 1024);

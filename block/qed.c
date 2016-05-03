@@ -347,20 +347,59 @@ static void crd_readv_bh_cb(void *p)
     CrdAIOCB *acb = p;
     BDRVCrdState *s = acb->common.bs->opaque;
     uint8_t *buf;
-    size_t offset, copied;
+    size_t copied;
     int i;
     struct iovec *iov;
+    int page_num;
+    size_t iov_len;
+    lzo_uint size_out;
+    page_num = acb->sector_num >> 3; // sector_size = 512 & page_size 4096
 
     qemu_bh_delete(acb->bh);
     acb->bh = NULL;
 
-    offset = acb->sector_num * BDRV_SECTOR_SIZE;
-
     copied = 0;
     for (i = 0; i < acb->qiov->niov; i++) {
         iov = &acb->qiov->iov[i];
+        iov_len = iov->iov_len;
         buf = iov->iov_base;
-        memcpy(buf, s->ptr_crd + offset + copied, iov->iov_len);
+        while (iov_len > 0) {
+            if (unlikely(iov_len < PAGE_SIZE)) {
+                /* fix this I ignore this since there's no request matches to PAGE_SIZE */
+
+                memset(buf, 0, iov_len);
+                /*
+                if (s->page_mapped[page_num] == 0) {
+                    memset(buf, 0, iov_len);
+                } else {
+                    memcpy(buf, s->ptr_crd[page_num], iov_len);
+                }
+                */
+                iov_len = 0;
+            } else {
+                if (s->page_mapped[page_num] == PAGE_ZERO_FILLED) {
+                    memset(buf, 0, PAGE_SIZE);
+                    //printf("Decompression - zero filled %d\n", page_num);
+                } else if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
+                    memcpy(buf, s->ptr_crd[page_num], PAGE_SIZE);
+                    //printf("Decompression - not compressed %d\n", page_num);
+                } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
+                    size_out = PAGE_SIZE;
+                    if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                       printf("Decompression failed! %d %d\n", page_num, s->page_compressed_size[page_num]);
+                    /*    int err =
+                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
+                       printf("ERRNO %d -  %s\n", err, strerror(errno));
+                    } else {
+                        //printf("Decompression success %d\n", page_num); */
+                    }
+                    memcpy(buf, s->buf_out, PAGE_SIZE);
+                }
+                iov_len -= PAGE_SIZE;
+                buf += PAGE_SIZE;
+            }
+            page_num++;
+        }
         copied += iov->iov_len;
     }
     acb->common.cb(acb->common.opaque, 0);
@@ -391,20 +430,72 @@ static void crd_writev_bh_cb(void *p)
     CrdAIOCB *acb = p;
     BDRVCrdState *s = acb->common.bs->opaque;
     uint8_t *buf;
-    size_t offset, copied;
+    size_t copied;
     int i;
     struct iovec *iov;
+    int page_num;
+    size_t iov_len;
+    lzo_uint size_out;
+
+    page_num = acb->sector_num >> 3; // sector_size = 512 & page_size 4096
 
     qemu_bh_delete(acb->bh);
     acb->bh = NULL;
 
-    offset = acb->sector_num * BDRV_SECTOR_SIZE;
-
     copied = 0;
     for (i = 0; i < acb->qiov->niov; i++) {
         iov = &acb->qiov->iov[i];
+        iov_len = iov->iov_len;
         buf = iov->iov_base;
-        memcpy(s->ptr_crd + offset + copied, buf, iov->iov_len);
+        while (iov_len > 0) {
+            /* TODO implement
+            if (unlikely(iov_len < PAGE_SIZE)) {
+                if (s->page_mapped[page_num] == 1) {
+                    free(s->ptr_crd[page_num]);
+                }
+                s->ptr_crd[page_num] = malloc(PAGE_SIZE);
+                s->page_mapped[page_num] = 1;
+                memcpy(s->ptr_crd[page_num], buf, iov_len);
+                iov_len = 0;
+            } else {
+            */
+                // 1 or 2
+                if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
+                    munlock(s->ptr_crd[page_num], PAGE_SIZE);
+                    free(s->ptr_crd[page_num]);
+                } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
+                    munlock(s->ptr_crd[page_num], s->page_compressed_size[page_num]);
+                    free(s->ptr_crd[page_num]);
+                }
+                if (page_zero_filled(buf)) {
+                    s->page_mapped[page_num] = PAGE_ZERO_FILLED;
+                    //printf("Not Compressed page_num %d - zero filled\n", page_num);
+                } else {
+                    /////compress here
+                    if (lzo1x_1_compress(buf, PAGE_SIZE, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                       //printf("Compression failed!\n");
+                    }
+                    if (size_out > PAGE_SIZE) {
+                        //use uncompressed
+                        s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
+                        s->ptr_crd[page_num] = malloc(PAGE_SIZE);
+                        mlock(s->ptr_crd[page_num], PAGE_SIZE);
+                        //printf("Not Compressed page_num %d\n", page_num);
+                        memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
+                    } else {
+                        s->page_mapped[page_num] = PAGE_COMPRESSED;
+                        s->ptr_crd[page_num] = malloc(size_out);
+                        mlock(s->ptr_crd[page_num], size_out);
+                        s->page_compressed_size[page_num] = size_out;
+                        //printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
+                        memcpy(s->ptr_crd[page_num], s->buf_out, size_out);
+                    }
+                }
+                iov_len -= PAGE_SIZE;
+                buf += PAGE_SIZE;
+            /*}*/
+            page_num++;
+        }
         copied += iov->iov_len;
     }
     acb->common.cb(acb->common.opaque, 0);
@@ -460,8 +551,8 @@ static int crd_reopen_prepare(BDRVReopenState *reopen_state,
 
 
 BlockDriver bdrv_crd = {
-    .format_name           = "qed",
-    .protocol_name         = "qed",
+    .format_name           = "qed-co",
+    .protocol_name         = "qed-co",
     .instance_size         = sizeof(BDRVCrdState),
     
     .bdrv_file_open        = crd_file_open,
@@ -477,8 +568,8 @@ BlockDriver bdrv_crd = {
 };
 
 BlockDriver bdrv_crd_aio = {
-    .format_name           = "crd-aio",
-    .protocol_name         = "crd-aio",
+    .format_name           = "qed",
+    .protocol_name         = "qed",
     .instance_size         = sizeof(BDRVCrdState),
     
     .bdrv_file_open        = crd_file_open,

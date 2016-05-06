@@ -50,7 +50,22 @@ typedef struct BDRVCrdState {
     int page_compressed_size[131072];
     lzo_bytep wrkmem;
     uint8_t *buf_out;
+    void *aio_ctx;
 } BDRVCrdState;
+
+typedef struct CrdPosixAIOData {
+    BlockDriverState *bs;
+    int aio_fildes;
+    union {
+        struct iovec *aio_iov;
+        void *aio_ioctl_buf;
+    };
+    int aio_niov;
+    uint64_t aio_nbytes;
+#define aio_ioctl_cmd   aio_nbytes /* for QEMU_AIO_IOCTL */
+    off_t aio_offset;
+    int aio_type;
+} CrdPosixAIOData;
 
 static int page_zero_filled(void *ptr)
 {
@@ -320,32 +335,11 @@ static coroutine_fn int crd_co_flush(BlockDriverState *bs)
     return 0;
 }
 
-typedef struct {
-    BlockAIOCB common;
-    QEMUBH *bh;
-    QEMUIOVector *qiov;
-
-    int64_t sector_num;
-    int nb_sectors;
-
-    size_t start;
-    size_t end;
-    /* 0 : write
-     * 1 : read
-     * 2 : flush
-     */
-    int type;
-} CrdAIOCB;
-
-static const AIOCBInfo crd_aiocb_info = {
-    .aiocb_size = sizeof(CrdAIOCB),
-};
-
-
-static void crd_readv_bh_cb(void *p)
+static int aio_worker_read(void *arg)
 {
-    CrdAIOCB *acb = p;
-    BDRVCrdState *s = acb->common.bs->opaque;
+    CrdPosixAIOData *aiocb = arg;
+    BDRVCrdState *s = aiocb->bs->opaque;
+    ssize_t ret = 0;
     uint8_t *buf;
     size_t copied;
     int i;
@@ -353,14 +347,11 @@ static void crd_readv_bh_cb(void *p)
     int page_num;
     size_t iov_len;
     lzo_uint size_out;
-    page_num = acb->sector_num >> 3; // sector_size = 512 & page_size 4096
-
-    qemu_bh_delete(acb->bh);
-    acb->bh = NULL;
+    page_num = aiocb->aio_offset / 4096;
 
     copied = 0;
-    for (i = 0; i < acb->qiov->niov; i++) {
-        iov = &acb->qiov->iov[i];
+    for (i = 0; i < aiocb->aio_niov; i++) {
+        iov = &aiocb->aio_iov[i];
         iov_len = iov->iov_len;
         buf = iov->iov_base;
         while (iov_len > 0) {
@@ -379,21 +370,21 @@ static void crd_readv_bh_cb(void *p)
             } else {
                 if (s->page_mapped[page_num] == PAGE_ZERO_FILLED) {
                     memset(buf, 0, PAGE_SIZE);
-                    //printf("Decompression - zero filled %d\n", page_num);
+                    //printf("READ - Decompression - zero filled %d\n", page_num);
                 } else if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
                     memcpy(buf, s->ptr_crd[page_num], PAGE_SIZE);
-                    //printf("Decompression - not compressed %d\n", page_num);
+                    //printf("READ - Decompression - not compressed %d\n", page_num);
                 } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
                     size_out = PAGE_SIZE;
-                    if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
-                       printf("Decompression failed! %d %d\n", page_num, s->page_compressed_size[page_num]);
-                    /*    int err =
-                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
-                       printf("ERRNO %d -  %s\n", err, strerror(errno));
+                    if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], buf, &size_out, s->wrkmem) != LZO_E_OK) {
+                        printf("READ - Decompression failed! %d %d -- ptr %p\n", page_num, s->page_compressed_size[page_num], s->ptr_crd[page_num]);
+                        /*
+                        int err =
+                        lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], buf, &size_out, s->wrkmem);
+                        printf("ERRNO %d -  %s\n", err, strerror(errno));
                     } else {
-                        //printf("Decompression success %d\n", page_num); */
+                        printf("Decompression success %d\n", page_num); */
                     }
-                    memcpy(buf, s->buf_out, PAGE_SIZE);
                 }
                 iov_len -= PAGE_SIZE;
                 buf += PAGE_SIZE;
@@ -402,8 +393,9 @@ static void crd_readv_bh_cb(void *p)
         }
         copied += iov->iov_len;
     }
-    acb->common.cb(acb->common.opaque, 0);
-    qemu_aio_unref(acb);
+
+    g_slice_free(CrdPosixAIOData, aiocb);
+    return ret;
 }
 
 static BlockAIOCB *crd_aio_readv(BlockDriverState *bs,
@@ -412,23 +404,27 @@ static BlockAIOCB *crd_aio_readv(BlockDriverState *bs,
                                   BlockCompletionFunc *cb,
                                   void *opaque)
 {
-    CrdAIOCB *acb;
+    CrdPosixAIOData *acb = g_slice_new(CrdPosixAIOData);
+    ThreadPool *pool;
 
-    acb = qemu_aio_get(&crd_aiocb_info, bs, cb, opaque);
+    acb->bs = bs;
 
-    acb->qiov = qiov;
-    acb->sector_num = sector_num;
-    acb->nb_sectors = nb_sectors;
+    acb->aio_nbytes = nb_sectors * BDRV_SECTOR_SIZE;
+    acb->aio_offset = sector_num * BDRV_SECTOR_SIZE;
 
-    acb->bh = aio_bh_new(bdrv_get_aio_context(bs), crd_readv_bh_cb, acb);
-    qemu_bh_schedule(acb->bh);
-    return &acb->common;
+    if (qiov) {
+        acb->aio_iov = qiov->iov;
+        acb->aio_niov = qiov->niov;
+    }
+    pool = aio_get_thread_pool(bdrv_get_aio_context(bs));
+    return thread_pool_submit_aio(pool, aio_worker_read, acb, cb, opaque);
 }
 
-static void crd_writev_bh_cb(void *p)
+static int aio_worker_write(void *arg)
 {
-    CrdAIOCB *acb = p;
-    BDRVCrdState *s = acb->common.bs->opaque;
+    CrdPosixAIOData *aiocb = arg;
+    BDRVCrdState *s = aiocb->bs->opaque;
+    ssize_t ret = 0;
     uint8_t *buf;
     size_t copied;
     int i;
@@ -436,15 +432,13 @@ static void crd_writev_bh_cb(void *p)
     int page_num;
     size_t iov_len;
     lzo_uint size_out;
-
-    page_num = acb->sector_num >> 3; // sector_size = 512 & page_size 4096
-
-    qemu_bh_delete(acb->bh);
-    acb->bh = NULL;
+    lzo_bytep wrkmem;
+    uint8_t *buf_out; 
+    page_num = aiocb->aio_offset / 4096;
 
     copied = 0;
-    for (i = 0; i < acb->qiov->niov; i++) {
-        iov = &acb->qiov->iov[i];
+    for (i = 0; i < aiocb->aio_niov; i++) {
+        iov = &aiocb->aio_iov[i];
         iov_len = iov->iov_len;
         buf = iov->iov_base;
         while (iov_len > 0) {
@@ -469,27 +463,31 @@ static void crd_writev_bh_cb(void *p)
                 }
                 if (page_zero_filled(buf)) {
                     s->page_mapped[page_num] = PAGE_ZERO_FILLED;
-                    //printf("Not Compressed page_num %d - zero filled\n", page_num);
+                    //printf("WRITE - Not Compressed page_num %d - zero filled\n", page_num);
                 } else {
                     /////compress here
-                    if (lzo1x_1_compress(buf, PAGE_SIZE, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
-                       //printf("Compression failed!\n");
+                    wrkmem = g_malloc(LZO1X_1_MEM_COMPRESS);
+                    buf_out = g_malloc(4200);
+                    if (lzo1x_1_compress(buf, PAGE_SIZE, buf_out, &size_out, wrkmem) != LZO_E_OK) {
+                       //printf("WRITE - Compression failed!\n");
                     }
                     if (size_out > PAGE_SIZE) {
                         //use uncompressed
                         s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
                         s->ptr_crd[page_num] = malloc(PAGE_SIZE);
                         mlock(s->ptr_crd[page_num], PAGE_SIZE);
-                        //printf("Not Compressed page_num %d\n", page_num);
+                        //printf("WRITE - Not Compressed page_num %d\n", page_num);
                         memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
                     } else {
                         s->page_mapped[page_num] = PAGE_COMPRESSED;
                         s->ptr_crd[page_num] = malloc(size_out);
                         mlock(s->ptr_crd[page_num], size_out);
                         s->page_compressed_size[page_num] = size_out;
-                        //printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
-                        memcpy(s->ptr_crd[page_num], s->buf_out, size_out);
+                        //printf("WRITE - Compressed page_num %d compressed_size %lu -- ptr %p\n", page_num, size_out, s->ptr_crd[page_num]);
+                        memcpy(s->ptr_crd[page_num], buf_out, size_out);
                     }
+                    g_free(wrkmem);
+                    g_free(buf_out);
                 }
                 iov_len -= PAGE_SIZE;
                 buf += PAGE_SIZE;
@@ -498,8 +496,9 @@ static void crd_writev_bh_cb(void *p)
         }
         copied += iov->iov_len;
     }
-    acb->common.cb(acb->common.opaque, 0);
-    qemu_aio_unref(acb);
+
+    g_slice_free(CrdPosixAIOData, aiocb);
+    return ret;
 }
 
 static BlockAIOCB *crd_aio_writev(BlockDriverState *bs,
@@ -508,31 +507,43 @@ static BlockAIOCB *crd_aio_writev(BlockDriverState *bs,
                                    BlockCompletionFunc *cb,
                                    void *opaque)
 {
-    CrdAIOCB *acb;
+    CrdPosixAIOData *acb = g_slice_new(CrdPosixAIOData);
+    ThreadPool *pool;
 
-    acb = qemu_aio_get(&crd_aiocb_info, bs, cb, opaque);
+    acb->bs = bs;
 
-    acb->qiov = qiov;
-    acb->sector_num = sector_num;
-    acb->nb_sectors = nb_sectors;
+    acb->aio_nbytes = nb_sectors * BDRV_SECTOR_SIZE;
+    acb->aio_offset = sector_num * BDRV_SECTOR_SIZE;
 
-    acb->bh = aio_bh_new(bdrv_get_aio_context(bs), crd_writev_bh_cb, acb);
-    qemu_bh_schedule(acb->bh);
-    return &acb->common;
+    if (qiov) {
+        acb->aio_iov = qiov->iov;
+        acb->aio_niov = qiov->niov;
+    }
+    pool = aio_get_thread_pool(bdrv_get_aio_context(bs));
+    return thread_pool_submit_aio(pool, aio_worker_write, acb, cb, opaque);
 }
 
-static void crd_flushv_bh_cb(void *p)
+static int aio_worker_flush(void *arg)
 {
-    CrdAIOCB *acb = p;
-    qemu_bh_delete(acb->bh);
-    acb->common.cb(acb->common.opaque, 0);
-    qemu_aio_unref(acb);
-        fprintf(stderr, "hanjae test %s\n", __func__);
+    CrdPosixAIOData *aiocb = arg;
+    ssize_t ret = 0;
+    g_slice_free(CrdPosixAIOData, aiocb);
+    return ret;
 }
+
 static BlockAIOCB *crd_aio_flush(BlockDriverState *bs,
                                   BlockCompletionFunc *cb,
                                   void *opaque)
 {
+    CrdPosixAIOData *acb = g_slice_new(CrdPosixAIOData);
+    ThreadPool *pool;
+
+    acb->bs = bs;
+
+
+    pool = aio_get_thread_pool(bdrv_get_aio_context(bs));
+    return thread_pool_submit_aio(pool, aio_worker_flush, acb, cb, opaque);
+    /*
     CrdAIOCB *acb;
 
     acb = qemu_aio_get(&crd_aiocb_info, bs, cb, opaque);
@@ -540,6 +551,7 @@ static BlockAIOCB *crd_aio_flush(BlockDriverState *bs,
     acb->bh = aio_bh_new(bdrv_get_aio_context(bs), crd_flushv_bh_cb, acb);
     qemu_bh_schedule(acb->bh);
     return &acb->common;
+    */
 }
 
 static int crd_reopen_prepare(BDRVReopenState *reopen_state,

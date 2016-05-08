@@ -250,6 +250,7 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
 {
     BDRVCrdState *s = bs->opaque;
     QemuOpts *opts;
+    int i;
     opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
     qemu_opts_absorb_qdict(opts, options, &error_abort);
     qemu_opts_del(opts);
@@ -266,6 +267,10 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     s->buf_out = g_malloc(4200);
     if (mlock(s->buf_out, 4200)) {
         fprintf(stderr, "hanjae mlock failed 2 %s %s\n", __func__, strerror(errno));
+    }
+    for (i = 0; i < 131072; i++) {
+        s->ptr_crd[i] = malloc(PAGE_SIZE);
+        mlock(s->ptr_crd[i], PAGE_SIZE);
     }
 
     //s->ptr_crd = malloc(CRD_SIZE * 1024 * 1024);
@@ -385,15 +390,15 @@ static void crd_readv_bh_cb(void *p)
                     //printf("Decompression - not compressed %d\n", page_num);
                 } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
                     size_out = PAGE_SIZE;
-                    if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                    if (lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], buf, &size_out, s->wrkmem) != LZO_E_OK) {
                        printf("Decompression failed! %d %d\n", page_num, s->page_compressed_size[page_num]);
                     /*    int err =
-                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
+                       lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], buf, &size_out, s->wrkmem);
                        printf("ERRNO %d -  %s\n", err, strerror(errno));
                     } else {
                         //printf("Decompression success %d\n", page_num); */
                     }
-                    memcpy(buf, s->buf_out, PAGE_SIZE);
+                    //memcpy(buf, s->buf_out, PAGE_SIZE);
                 }
                 iov_len -= PAGE_SIZE;
                 buf += PAGE_SIZE;
@@ -435,7 +440,7 @@ static void crd_writev_bh_cb(void *p)
     struct iovec *iov;
     int page_num;
     size_t iov_len;
-    lzo_uint size_out;
+    //lzo_uint size_out;
 
     page_num = acb->sector_num >> 3; // sector_size = 512 & page_size 4096
 
@@ -460,21 +465,30 @@ static void crd_writev_bh_cb(void *p)
             } else {
             */
                 // 1 or 2
-                if (s->page_mapped[page_num] == PAGE_UNCOMPRESSED) {
-                    munlock(s->ptr_crd[page_num], PAGE_SIZE);
-                    free(s->ptr_crd[page_num]);
-                } else if (s->page_mapped[page_num] == PAGE_COMPRESSED) {
-                    munlock(s->ptr_crd[page_num], s->page_compressed_size[page_num]);
-                    free(s->ptr_crd[page_num]);
-                }
                 if (page_zero_filled(buf)) {
                     s->page_mapped[page_num] = PAGE_ZERO_FILLED;
                     //printf("Not Compressed page_num %d - zero filled\n", page_num);
                 } else {
+                    s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
+                    memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
                     /////compress here
-                    if (lzo1x_1_compress(buf, PAGE_SIZE, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
-                       //printf("Compression failed!\n");
+                    /*
+                    if (lzo1x_1_compress(buf, PAGE_SIZE, s->ptr_crd[page_num], &size_out, s->wrkmem) != LZO_E_OK) {
+                        printf("Compression failed!\n");
+                        s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
+                        //s->ptr_crd[page_num] = malloc(PAGE_SIZE);
+                    } else {
+                        if (size_out > PAGE_SIZE) {
+                            //use uncompressed
+                            s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
+                            memcpy(s->ptr_crd[page_num], buf, PAGE_SIZE);
+                        } else {
+                            s->page_mapped[page_num] = PAGE_COMPRESSED;
+                            s->page_compressed_size[page_num] = size_out;
+                        }
                     }
+                    */
+                    /*
                     if (size_out > PAGE_SIZE) {
                         //use uncompressed
                         s->page_mapped[page_num] = PAGE_UNCOMPRESSED;
@@ -490,6 +504,7 @@ static void crd_writev_bh_cb(void *p)
                         //printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
                         memcpy(s->ptr_crd[page_num], s->buf_out, size_out);
                     }
+                    */
                 }
                 iov_len -= PAGE_SIZE;
                 buf += PAGE_SIZE;

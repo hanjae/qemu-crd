@@ -54,7 +54,44 @@ typedef struct BDRVCrdState {
     PageEntity p_table[131072];
     lzo_bytep wrkmem;
     uint8_t *buf_out;
+    int *buffer;
 } BDRVCrdState;
+void *first_fit_4kb(BDRVCrdState *s);
+void free_buffer(int *ptr);
+void alloc_buffer(int *ptr, int byte_size);
+
+void *first_fit_4kb(BDRVCrdState *s) {
+    int *buffer = s->buffer;
+    while (*buffer < 1024 || *buffer < 0) {
+        buffer += (*(int *)buffer & ~(1<<31));
+        buffer++;
+    }
+    //printf("found %ld\n", (long)(buffer + 1));
+    return buffer + 1;
+}
+void free_buffer(int *ptr) {
+    int *size_ptr = ptr-1;
+    int size = *size_ptr & (1 << 31);
+    //munlock(ptr, size);
+    if (*(size_ptr + size) >= 0) {
+        *size_ptr = size + *(size_ptr + size + 1);
+    } else {
+        *size_ptr = size;
+    }
+    //printf("free %ld\n", (long)ptr);
+}
+
+void alloc_buffer(int *ptr, int byte_size) {
+    int new_size = ((byte_size - 1) >> 2) + 1;
+    int *size_ptr = ptr-1;
+    int size = *size_ptr;
+    //printf("alloc bytes %d %d %d\n", byte_size, new_size, size);
+    *(size_ptr + new_size + 1) = size - new_size;
+    *size_ptr = new_size | (1 << 31);
+    //mlock(ptr, new_size);
+    //printf("alloc %ld, %d %d\n", (long)ptr, byte_size, *(ptr-1));
+}
+
 
 static int page_zero_filled(void *ptr)
 {
@@ -123,15 +160,19 @@ static int coroutine_fn crd_co_readv(BlockDriverState *bs, int64_t sector_num,
                         break;
                     case PAGE_COMPRESSED:
                         size_out = PAGE_SIZE;
-                        if (lzo1x_decompress_safe(e->ptr_crd, e->page_compressed_size, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                        if (lzo1x_decompress_safe(e->ptr_crd, e->page_compressed_size, buf, &size_out, s->wrkmem) != LZO_E_OK) {
                            printf("Decompression failed! %d %d\n", page_num, e->page_compressed_size);
+                           /*
+                            printf("failed ptr %ld\n", (long)e->ptr_crd);
+                            int err = lzo1x_decompress_safe(e->ptr_crd, e->page_compressed_size, s->buf_out, &size_out, s->wrkmem);
+                           printf("ERRNO %d -  %s\n", err, strerror(errno));
+                           */
                         /*    int err =
                            lzo1x_decompress_safe(s->ptr_crd[page_num], s->page_compressed_size[page_num], s->buf_out, &size_out, s->wrkmem);
                            printf("ERRNO %d -  %s\n", err, strerror(errno));
                         } else {
                             //printf("Decompression success %d\n", page_num); */
                         }
-                        memcpy(buf, s->buf_out, PAGE_SIZE);
                         break;
                     default:
                         printf("switch: default - fail!\n");
@@ -170,6 +211,7 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
     size_t iov_len;
     //size_t size = nb_sectors * BDRV_SECTOR_SIZE;
     PageEntity *e;
+    void *comp_buffer;
 
     lzo_uint size_out;
 
@@ -197,34 +239,31 @@ static int coroutine_fn crd_co_writev(BlockDriverState *bs, int64_t sector_num,
                 e = &s->p_table[page_num];
                 // 1 or 2
                 if (unlikely(e->page_status == PAGE_UNCOMPRESSED)) {
-                    munlock(e->ptr_crd, PAGE_SIZE);
-                    free(e->ptr_crd);
+                    free_buffer(e->ptr_crd);
                 } else if (e->page_status == PAGE_COMPRESSED) {
-                    munlock(e->ptr_crd, e->page_compressed_size);
-                    free(e->ptr_crd);
+                    free_buffer(e->ptr_crd);
                 }
+                comp_buffer = first_fit_4kb(s);
+
                 if (page_zero_filled(buf)) {
                     e->page_status = PAGE_ZERO_FILLED;
                     //printf("Not Compressed page_num %d - zero filled\n", page_num);
                 } else {
                     /////compress here
-                    if (lzo1x_1_compress(buf, PAGE_SIZE, s->buf_out, &size_out, s->wrkmem) != LZO_E_OK) {
+                    if (lzo1x_1_compress(buf, PAGE_SIZE, comp_buffer, &size_out, s->wrkmem) != LZO_E_OK) {
                        //printf("Compression failed!\n");
                     }
                     if (size_out > PAGE_SIZE) {
                         //use uncompressed
                         e->page_status = PAGE_UNCOMPRESSED;
-                        e->ptr_crd = malloc(PAGE_SIZE);
-                        mlock(e->ptr_crd, PAGE_SIZE);
-                        //printf("Not Compressed page_num %d\n", page_num);
+                        e->ptr_crd = comp_buffer;
                         memcpy(e->ptr_crd, buf, PAGE_SIZE);
+                        alloc_buffer(comp_buffer, PAGE_SIZE);
                     } else {
                         e->page_status = PAGE_COMPRESSED;
-                        e->ptr_crd = malloc(size_out);
-                        mlock(e->ptr_crd, size_out);
+                        e->ptr_crd = comp_buffer;
                         e->page_compressed_size = size_out;
-                        //printf("Compressed page_num %d compressed_size %lu\n", page_num, size_out);
-                        memcpy(e->ptr_crd, s->buf_out, size_out);
+                        alloc_buffer(comp_buffer, size_out);
                     }
                 }
                 iov_len -= PAGE_SIZE;
@@ -278,6 +317,12 @@ static int crd_file_open(BlockDriverState *bs, QDict *options, int bdrv_flags,
     if (mlock(s->buf_out, 4200)) {
         fprintf(stderr, "hanjae mlock failed 2 %s %s\n", __func__, strerror(errno));
     }
+    s->buffer = g_malloc(256 * 1024 * 1024);
+    if (mlock(s->buffer, 256 * 1024 * 1024)) {
+        fprintf(stderr, "hanjae mlock buffer failed %s\n", strerror(errno));
+    }
+    *(int *)s->buffer = 256 * 1024 * 1024 - 4;
+
 
     //s->ptr_crd = malloc(CRD_SIZE * 1024 * 1024);
     /*
@@ -327,6 +372,8 @@ static void crd_close(BlockDriverState *bs)
     g_free(s->wrkmem);
     munlock(s->buf_out, 4200);
     g_free(s->buf_out);
+    munlock(s->buffer, 256 * 1024 * 1024);
+    g_free(s->buffer);
     //munlock(s->ptr_crd, CRD_SIZE * 1024 * 1024);
     //free(s->ptr_crd);
     //munmap(s->ptr_crd, CRD_SIZE * 1024 * 1024);
